@@ -1,47 +1,28 @@
-"""Load Flux-schnell with NF4 quantization for T4/A100 GPUs."""
+"""Load Stable Diffusion 1.5 for T4/free Colab GPUs."""
 
 import torch
-from diffusers import FluxPipeline
-from scripts.config import MODEL_ID, NUM_INFERENCE_STEPS
+from diffusers import StableDiffusionPipeline
+from scripts.config import MODEL_ID
 
 
-def load_flux_pipeline(quantize_nf4: bool = True, cpu_offload: bool = True) -> FluxPipeline:
-    """Load Flux-schnell pipeline with memory optimizations.
+def load_pipeline(device: str = "cuda") -> StableDiffusionPipeline:
+    """Load SD1.5 pipeline. Fits comfortably on a T4 in float16.
 
     Args:
-        quantize_nf4: Use NF4 quantization via bitsandbytes (saves ~6GB VRAM).
-        cpu_offload: Enable model CPU offloading for low-VRAM GPUs (T4).
+        device: Target device ("cuda" or "cpu").
 
     Returns:
-        Configured FluxPipeline ready for inference.
+        Configured StableDiffusionPipeline ready for inference.
     """
-    load_kwargs = {
-        "torch_dtype": torch.bfloat16,
-    }
-
-    if quantize_nf4:
-        from diffusers import PipelineQuantizationConfig
-        nf4_config = PipelineQuantizationConfig(
-            quant_backend="bitsandbytes_4bit",
-            quant_kwargs={
-                "load_in_4bit": True,
-                "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": torch.bfloat16,
-            },
-            components_to_quantize=["transformer"],
-        )
-        load_kwargs["quantization_config"] = nf4_config
-
-    pipe = FluxPipeline.from_pretrained(MODEL_ID, **load_kwargs)
-
-    if cpu_offload:
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe = pipe.to("cuda")
-
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        safety_checker=None,
+    )
+    pipe = pipe.to(device)
     return pipe
 
 
-def get_transformer(pipe: FluxPipeline):
-    """Return the FluxTransformer2DModel from the pipeline."""
-    return pipe.transformer
+def get_unet(pipe: StableDiffusionPipeline):
+    """Return the UNet2DConditionModel from the pipeline."""
+    return pipe.unet

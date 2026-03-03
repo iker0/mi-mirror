@@ -3,26 +3,29 @@
 from pathlib import Path
 
 # ── Model ──────────────────────────────────────────────────────────────────────
-MODEL_ID = "black-forest-labs/FLUX.1-schnell"
+MODEL_ID = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 RESOLUTION = 512
-NUM_INFERENCE_STEPS = 4  # Schnell's distilled schedule
+NUM_INFERENCE_STEPS = 20
 
-# ── Flux architecture constants ────────────────────────────────────────────────
-NUM_DUAL_STREAM_BLOCKS = 19   # MMDiT blocks (joint text+image attention)
-NUM_SINGLE_STREAM_BLOCKS = 38 # Single-stream DiT blocks
-NUM_BLOCKS = NUM_DUAL_STREAM_BLOCKS + NUM_SINGLE_STREAM_BLOCKS  # 57 total
-NUM_HEADS = 24
-HEAD_DIM = 128  # 3072 / 24
+# ── SD1.5 architecture constants ──────────────────────────────────────────────
+# SD1.5 UNet has cross-attention blocks at multiple resolutions.
+# Each block has self-attention (attn1) and cross-attention (attn2).
+# We only analyze self-attention (image-to-image).
+#
+# Latent space: 512/8 = 64x64
+# Down blocks with attention: 3 (at 64x64, 32x32, 16x16), 2 layers each = 6
+# Mid block: 1 layer at 8x8 = 1
+# Up blocks with attention: 3 (at 16x16, 32x32, 64x64), 3 layers each = 9
+# Total self-attention blocks: 16
+# Heads: 8 per block
 
-# ── Token-space geometry ───────────────────────────────────────────────────────
-# Flux patchifies: 2x2 patches on top of 8x VAE downsampling = 16x total
-PATCH_SIZE = 2
 VAE_DOWNSCALE = 8
-TOTAL_DOWNSCALE = PATCH_SIZE * VAE_DOWNSCALE  # 16
-GRID_H = RESOLUTION // TOTAL_DOWNSCALE  # 32
-GRID_W = RESOLUTION // TOTAL_DOWNSCALE  # 32
-NUM_IMAGE_TOKENS = GRID_H * GRID_W  # 1024
-MAX_TEXT_TOKENS = 512  # T5-XXL max sequence length for Flux
+LATENT_SIZE = RESOLUTION // VAE_DOWNSCALE  # 64
+
+NUM_HEADS = 8  # SD1.5 uses 8 attention heads at all resolutions
+
+# Block output channels per down block level
+BLOCK_OUT_CHANNELS = (320, 640, 1280, 1280)
 
 # ── Seeds ──────────────────────────────────────────────────────────────────────
 SEEDS = [42, 137, 256]
@@ -64,4 +67,5 @@ NON_MIRROR_PROMPTS = [
 
 # ── Experiment parameters ──────────────────────────────────────────────────────
 TOP_K_CANDIDATES = 10  # Number of candidate heads to investigate in detail
-TIMESTEPS_TO_CAPTURE = list(range(NUM_INFERENCE_STEPS))  # [0, 1, 2, 3]
+# Capture CRA at every timestep (scalars are cheap)
+TIMESTEPS_TO_CAPTURE = list(range(NUM_INFERENCE_STEPS))

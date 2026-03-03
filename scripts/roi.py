@@ -1,7 +1,7 @@
 """ROI utilities for mapping between token-space and pixel-space.
 
-Flux token grid: 32x32 (at 512px resolution) due to 2x2 patchify + 8x VAE = 16x total.
-Token indices are row-major: token_idx = row * GRID_W + col.
+SD1.5 has self-attention at multiple resolutions (64x64, 32x32, 16x16, 8x8).
+ROIs are defined in pixel space and can be projected to any token grid resolution.
 """
 
 from dataclasses import dataclass
@@ -9,106 +9,81 @@ from typing import List, Tuple
 
 import numpy as np
 
-from scripts.config import GRID_H, GRID_W, TOTAL_DOWNSCALE, RESOLUTION, NUM_IMAGE_TOKENS
+from scripts.config import VAE_DOWNSCALE, RESOLUTION, LATENT_SIZE
 
 
 @dataclass
 class ROI:
-    """Region of interest in token space."""
+    """Region of interest defined by a fractional bounding box (resolution-independent)."""
     name: str
-    token_indices: List[int]
+    col_start: float  # 0.0 to 1.0
+    col_end: float
+    row_start: float  # 0.0 to 1.0
+    row_end: float
 
-    @property
-    def size(self) -> int:
-        return len(self.token_indices)
+    def token_indices(self, grid_size: int) -> List[int]:
+        """Get token indices for this ROI at a given grid resolution.
+
+        Args:
+            grid_size: Spatial resolution of the token grid (e.g. 64, 32, 16, 8).
+
+        Returns:
+            List of token indices (row-major) within this ROI.
+        """
+        c0 = int(self.col_start * grid_size)
+        c1 = int(self.col_end * grid_size)
+        r0 = int(self.row_start * grid_size)
+        r1 = int(self.row_end * grid_size)
+        indices = []
+        for r in range(r0, r1):
+            for c in range(c0, c1):
+                indices.append(r * grid_size + c)
+        return indices
+
+    def token_count(self, grid_size: int) -> int:
+        return len(self.token_indices(grid_size))
 
     def to_pixel_mask(self, resolution: int = RESOLUTION) -> np.ndarray:
-        """Convert token indices to a binary pixel-space mask."""
+        """Convert to a binary pixel-space mask."""
         mask = np.zeros((resolution, resolution), dtype=bool)
-        for idx in self.token_indices:
-            row = idx // GRID_W
-            col = idx % GRID_W
-            y0 = row * TOTAL_DOWNSCALE
-            y1 = y0 + TOTAL_DOWNSCALE
-            x0 = col * TOTAL_DOWNSCALE
-            x1 = x0 + TOTAL_DOWNSCALE
-            mask[y0:y1, x0:x1] = True
+        x0 = int(self.col_start * resolution)
+        x1 = int(self.col_end * resolution)
+        y0 = int(self.row_start * resolution)
+        y1 = int(self.row_end * resolution)
+        mask[y0:y1, x0:x1] = True
         return mask
 
 
-def pixel_to_token(px_x: int, px_y: int) -> int:
-    """Convert pixel coordinate to token index."""
-    row = px_y // TOTAL_DOWNSCALE
-    col = px_x // TOTAL_DOWNSCALE
-    return row * GRID_W + col
-
-
-def token_to_pixel_center(token_idx: int) -> Tuple[int, int]:
-    """Convert token index to pixel coordinate (center of patch)."""
-    row = token_idx // GRID_W
-    col = token_idx % GRID_W
-    px_x = col * TOTAL_DOWNSCALE + TOTAL_DOWNSCALE // 2
-    px_y = row * TOTAL_DOWNSCALE + TOTAL_DOWNSCALE // 2
-    return px_x, px_y
-
-
 def split_vertical(split_frac: float = 0.5) -> Tuple[ROI, ROI]:
-    """Split image into left and right ROIs at a given fraction.
+    """Split image into left and right ROIs.
 
     For mirror prompts with "object on left, mirror on right", use default 0.5.
     Returns (left_roi, right_roi) = (object_roi, reflection_roi).
     """
-    split_col = int(GRID_W * split_frac)
-    left_indices = []
-    right_indices = []
-    for row in range(GRID_H):
-        for col in range(GRID_W):
-            idx = row * GRID_W + col
-            if col < split_col:
-                left_indices.append(idx)
-            else:
-                right_indices.append(idx)
     return (
-        ROI(name="left_object", token_indices=left_indices),
-        ROI(name="right_reflection", token_indices=right_indices),
+        ROI(name="left_object", col_start=0.0, col_end=split_frac, row_start=0.0, row_end=1.0),
+        ROI(name="right_reflection", col_start=split_frac, col_end=1.0, row_start=0.0, row_end=1.0),
     )
 
 
 def split_horizontal(split_frac: float = 0.5) -> Tuple[ROI, ROI]:
     """Split image into top and bottom ROIs."""
-    split_row = int(GRID_H * split_frac)
-    top_indices = []
-    bottom_indices = []
-    for row in range(GRID_H):
-        for col in range(GRID_W):
-            idx = row * GRID_W + col
-            if row < split_row:
-                top_indices.append(idx)
-            else:
-                bottom_indices.append(idx)
     return (
-        ROI(name="top", token_indices=top_indices),
-        ROI(name="bottom", token_indices=bottom_indices),
+        ROI(name="top", col_start=0.0, col_end=1.0, row_start=0.0, row_end=split_frac),
+        ROI(name="bottom", col_start=0.0, col_end=1.0, row_start=split_frac, row_end=1.0),
     )
 
 
-def bbox_roi(name: str, x0: int, y0: int, x1: int, y1: int) -> ROI:
-    """Create an ROI from pixel-space bounding box coordinates.
-
-    Args:
-        name: Label for this ROI.
-        x0, y0: Top-left corner in pixels.
-        x1, y1: Bottom-right corner in pixels.
-    """
-    col0 = x0 // TOTAL_DOWNSCALE
-    row0 = y0 // TOTAL_DOWNSCALE
-    col1 = min((x1 + TOTAL_DOWNSCALE - 1) // TOTAL_DOWNSCALE, GRID_W)
-    row1 = min((y1 + TOTAL_DOWNSCALE - 1) // TOTAL_DOWNSCALE, GRID_H)
-    indices = []
-    for row in range(row0, row1):
-        for col in range(col0, col1):
-            indices.append(row * GRID_W + col)
-    return ROI(name=name, token_indices=indices)
+def bbox_roi(name: str, x0: int, y0: int, x1: int, y1: int,
+             resolution: int = RESOLUTION) -> ROI:
+    """Create an ROI from pixel-space bounding box coordinates."""
+    return ROI(
+        name=name,
+        col_start=x0 / resolution,
+        col_end=x1 / resolution,
+        row_start=y0 / resolution,
+        row_end=y1 / resolution,
+    )
 
 
 def get_default_rois() -> Tuple[ROI, ROI]:
