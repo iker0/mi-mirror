@@ -20,11 +20,15 @@ def load_flux_pipeline(quantize_nf4: bool = True, cpu_offload: bool = True) -> F
     }
 
     if quantize_nf4:
-        from diffusers import BitsAndBytesConfig
-        nf4_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+        from diffusers import BitsAndBytesConfig, PipelineQuantizationConfig
+        nf4_config = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": torch.bfloat16,
+            },
+            components_to_quantize=["transformer"],
         )
         load_kwargs["quantization_config"] = nf4_config
 
