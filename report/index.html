@@ -218,8 +218,8 @@
 <body>
     <header>
         <h1>How Do Vision Models Render Reflections in Mirrors?</h1>
-        <p class="subtitle">Searching for "Reflection Heads" in Stable Diffusion — a mechanistic interpretability investigation</p>
-        <p class="meta">Mechanistic Interpretability &middot; Diffusion Models &middot; Stable Diffusion 1.5</p>
+        <p class="subtitle">Searching for "Reflection Heads" in Flux — a mechanistic interpretability investigation</p>
+        <p class="meta">Mechanistic Interpretability &middot; Diffusion Models &middot; Flux</p>
     </header>
 
     <p>
@@ -227,30 +227,31 @@
     </p>
 
     <p>
-        We investigate this question in <strong>Stable Diffusion 1.5</strong>, a widely-used text-to-image diffusion model with a UNet backbone. By extracting and analyzing attention patterns across all 128 self-attention head positions (16 blocks &times; 8 heads), we search for heads that preferentially attend across the mirror boundary — from reflection regions to object regions — when generating mirror images but not matched non-mirror scenes.
+        We investigate this question in <strong>Flux-schnell</strong>, a state-of-the-art text-to-image model built on the MMDiT (Multi-Modal Diffusion Transformer) architecture. By extracting and analyzing attention patterns across all 1,368 attention heads (57 blocks &times; 24 heads), we search for heads that preferentially attend across the mirror boundary — from reflection regions to object regions — when generating mirror images but not matched non-mirror scenes.
     </p>
 
     <h2>The Architecture</h2>
 
-    <p>SD1.5 uses a UNet with cross-attention (text&rarr;image) and self-attention (image&rarr;image) at multiple resolutions. We analyze <strong>self-attention only</strong>:</p>
+    <p>Flux uses a hybrid transformer with two types of blocks:</p>
 
     <div class="architecture-diagram">
-<span class="highlight-dim">Input: 512&times;512 image &rarr; 64&times;64 latent (8&times; VAE downsampling)</span>
+<span class="highlight-dim">Input: text tokens (T5-XXL) + image tokens (32&times;32 grid)</span>
 
-<span class="highlight-block">Down Blocks</span> <span class="highlight-dim">&mdash; 6 self-attention layers</span>
-<span class="highlight-arrow">  &rarr;</span> 64&times;64 (2 layers) &rarr; 32&times;32 (2 layers) &rarr; 16&times;16 (2 layers)
+<span class="highlight-block">Dual-Stream Blocks (0-18)</span> <span class="highlight-dim">&mdash; 19 blocks</span>
+<span class="highlight-arrow">  &rarr;</span> Separate Q/K/V projections for text and image
+<span class="highlight-arrow">  &rarr;</span> Concatenate into joint sequence for attention
+<span class="highlight-arrow">  &rarr;</span> Split apart for separate FFN streams
 
-<span class="highlight-block">Mid Block</span> <span class="highlight-dim">&mdash; 1 self-attention layer at 8&times;8</span>
+<span class="highlight-block">Single-Stream Blocks (19-56)</span> <span class="highlight-dim">&mdash; 38 blocks</span>
+<span class="highlight-arrow">  &rarr;</span> Text + image concatenated as single sequence
+<span class="highlight-arrow">  &rarr;</span> Unified self-attention + MLP
 
-<span class="highlight-block">Up Blocks</span> <span class="highlight-dim">&mdash; 9 self-attention layers</span>
-<span class="highlight-arrow">  &rarr;</span> 16&times;16 (3 layers) &rarr; 32&times;32 (3 layers) &rarr; 64&times;64 (3 layers)
-
-<span class="highlight-dim">Each block: 8 heads, varying head dim per resolution</span>
-<span class="highlight-dim">Simple scaled dot-product attention (no QK-norm, no RoPE)</span>
+<span class="highlight-dim">Each block: 24 heads &times; 128-dim = 3072 hidden dim</span>
+<span class="highlight-dim">QK-Norm (RMSNorm) + Rotary Position Embeddings</span>
     </div>
 
     <p>
-        Self-attention operates at four resolutions (64&times;64, 32&times;32, 16&times;16, 8&times;8), with token counts ranging from 4,096 down to 64. Higher-resolution blocks capture fine spatial relationships; lower-resolution blocks capture global structure.
+        At 512&times;512 resolution, Flux produces a 32&times;32 grid of image tokens (1,024 total, due to 2&times;2 patchification + 8&times; VAE downsampling). Each attention head operates on a joint sequence of <code>~512 text + 1024 image = ~1536</code> tokens.
     </p>
 
     <h2>Method</h2>
@@ -292,7 +293,7 @@
     <h2><span class="step-badge">Step 1</span> Selectivity Heatmap</h2>
 
     <p>
-        We generate 8 mirror and 8 non-mirror prompts, each with 3 seeds (48 images total). For every self-attention head in SD1.5's UNet, we compute the selectivity score. The heatmap below shows which heads consistently attend more cross-region on mirror images.
+        We generate 8 mirror and 8 non-mirror prompts, each with 3 seeds (48 images total). For every head in every block, we compute the selectivity score. The heatmap below shows which heads consistently attend more cross-region on mirror images.
     </p>
 
     <p class="interactive-note">Hover over cells to see exact values. Click and drag to zoom.</p>
@@ -313,7 +314,7 @@
     <h2><span class="step-badge green">Step 3</span> Temporal Profile</h2>
 
     <p>
-        SD1.5 uses 20 denoising steps. We track CRA across all steps to understand when reflection attention is most active. Does the model establish mirror correspondence early (layout phase) or refine it later (detail phase)?
+        Flux-schnell uses only 4 denoising steps (a distilled schedule). We track CRA across these steps to understand when reflection attention is most active. Does the model establish mirror correspondence early (layout phase) or refine it later (detail phase)?
     </p>
 
     <div id="temporal-chart" class="plot-container"></div>
@@ -358,7 +359,7 @@
             <strong>ROI sensitivity:</strong> We use a simple vertical split, which may not perfectly align with actual object/reflection boundaries. Bounding-box ROIs or segmentation masks would improve precision.
         </p>
         <p style="font-size:0.9rem; margin-top:0.5rem">
-            <strong>Model capacity:</strong> SD1.5 is a relatively small model compared to modern alternatives. The reflection patterns we find here may be even more pronounced in larger models like SDXL or Flux.
+            <strong>NF4 quantization:</strong> While absolute attention values may shift under 4-bit quantization, selectivity (relative differences) should be robust. Verification with full-precision inference on A100 is recommended.
         </p>
     </div>
 
@@ -377,7 +378,7 @@
     </div>
 
     <footer>
-        <p>Mirror Reflection Mechanistic Interpretability &middot; Built with Stable Diffusion 1.5 + diffusers</p>
+        <p>Mirror Reflection Mechanistic Interpretability &middot; Built with Flux-schnell + diffusers</p>
     </footer>
 
     <script>
@@ -386,16 +387,17 @@
     // After running the notebooks, replace with real data from experiments/.
 
     function generateDemoSelectivity() {
-        const blocks = 16, heads = 8;
+        const blocks = 57, heads = 24;
         const z = [];
         for (let b = 0; b < blocks; b++) {
             const row = [];
             for (let h = 0; h < heads; h++) {
+                // Base: near zero with some noise
                 let val = (Math.random() - 0.5) * 0.002;
-                // Inject candidate heads with higher selectivity
-                if ((b === 3 && h === 5) || (b === 5 && h === 2) ||
-                    (b === 9 && h === 6) || (b === 12 && h === 1) ||
-                    (b === 14 && h === 4)) {
+                // Inject some "candidate" heads with higher selectivity
+                if ((b === 8 && h === 15) || (b === 12 && h === 7) ||
+                    (b === 25 && h === 19) || (b === 35 && h === 3) ||
+                    (b === 42 && h === 11)) {
                     val = 0.005 + Math.random() * 0.008;
                 }
                 row.push(val);
@@ -407,41 +409,32 @@
 
     // Step 1: Selectivity Heatmap
     const selectivityData = generateDemoSelectivity();
-    const blockLabels = [
-        'D0.0 (64)', 'D0.1 (64)', 'D1.0 (32)', 'D1.1 (32)',
-        'D2.0 (16)', 'D2.1 (16)', 'M0.0 (8)',
-        'U1.0 (16)', 'U1.1 (16)', 'U1.2 (16)',
-        'U2.0 (32)', 'U2.1 (32)', 'U2.2 (32)',
-        'U3.0 (64)', 'U3.1 (64)', 'U3.2 (64)'
-    ];
     Plotly.newPlot('selectivity-heatmap', [{
         z: selectivityData,
-        y: blockLabels,
         type: 'heatmap',
         colorscale: 'RdBu',
         zmid: 0,
         colorbar: { title: 'Selectivity<br>Score' },
-        hovertemplate: '%{y}, Head %{x}<br>Selectivity: %{z:.5f}<extra></extra>'
+        hovertemplate: 'Block %{y}, Head %{x}<br>Selectivity: %{z:.5f}<extra></extra>'
     }], {
-        title: { text: 'Reflection Selectivity: All 128 Self-Attention Heads', font: { size: 14 } },
-        xaxis: { title: 'Head Index' },
-        yaxis: { title: 'Block (position.layer, resolution)', autorange: 'reversed' },
-        shapes: [
-            { type: 'line', x0: -0.5, x1: 7.5, y0: 5.5, y1: 5.5,
-              line: { color: '#2ecc71', width: 2, dash: 'dash' } },
-            { type: 'line', x0: -0.5, x1: 7.5, y0: 6.5, y1: 6.5,
-              line: { color: '#2ecc71', width: 2, dash: 'dash' } }
-        ],
-        annotations: [
-            { x: 4, y: 6, text: 'Mid block', showarrow: false,
-              font: { color: '#2ecc71', size: 10 } }
-        ],
-        height: 450,
-        margin: { t: 50, b: 60, l: 100, r: 30 }
+        title: { text: 'Reflection Selectivity: All 1,368 Heads', font: { size: 14 } },
+        xaxis: { title: 'Head Index', dtick: 4 },
+        yaxis: { title: 'Block Index', dtick: 5, autorange: 'reversed' },
+        shapes: [{
+            type: 'line', x0: -0.5, x1: 23.5, y0: 18.5, y1: 18.5,
+            line: { color: '#2ecc71', width: 2, dash: 'dash' }
+        }],
+        annotations: [{
+            x: 12, y: 18.5, text: 'Dual → Single boundary',
+            showarrow: false, font: { color: '#2ecc71', size: 10 },
+            yshift: -12
+        }],
+        height: 500,
+        margin: { t: 50, b: 60, l: 60, r: 30 }
     }, { responsive: true });
 
     // Step 2: Entropy comparison
-    const candidateLabels = ['D1.1 H5', 'D2.1 H2', 'U1.2 H6', 'U2.2 H1', 'U3.1 H4'];
+    const candidateLabels = ['B8H15', 'B12H7', 'B25H19', 'B35H3', 'B42H11'];
     Plotly.newPlot('entropy-chart', [
         {
             x: candidateLabels,
@@ -468,16 +461,13 @@
     }, { responsive: true });
 
     // Step 3: Temporal profiles
-    const steps = Array.from({length: 20}, (_, i) => i);
+    const steps = [0, 1, 2, 3];
     const colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12'];
     const temporalTraces = candidateLabels.map((label, i) => {
-        const baseProfile = steps.map(t => {
-            const peak = 5 + i * 2;
-            return 0.002 + 0.008 * Math.exp(-Math.pow(t - peak, 2) / 20) + Math.random() * 0.001;
-        });
+        const baseProfile = [0.002, 0.005, 0.008, 0.004];
         return {
             x: steps,
-            y: baseProfile,
+            y: baseProfile.map(v => v * (1 + i * 0.3) + Math.random() * 0.001),
             name: label,
             mode: 'lines+markers',
             line: { color: colors[i], width: 2 },
@@ -486,7 +476,7 @@
     });
     Plotly.newPlot('temporal-chart', temporalTraces, {
         title: { text: 'Cross-Region Attention Across Denoising Steps', font: { size: 14 } },
-        xaxis: { title: 'Denoising Step', dtick: 5 },
+        xaxis: { title: 'Denoising Step', dtick: 1 },
         yaxis: { title: 'CRA' },
         height: 350,
         margin: { t: 50, b: 60, l: 60, r: 30 }

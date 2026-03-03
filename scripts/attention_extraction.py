@@ -1,13 +1,11 @@
-"""Custom attention processors for extracting attention patterns from SD1.5.
-
-SD1.5 UNet has self-attention (attn1) and cross-attention (attn2) in each block.
-We only intercept self-attention for CRA analysis.
+"""Custom attention processors for extracting attention patterns from Flux.
 
 Two processors:
-1. SD15AttnProcessorCRAOnly — screening: computes CRA scalar per head.
-2. SD15AttnProcessorWithStorage — detailed: stores full self-attention maps on CPU.
+1. FluxAttnProcessorCRAOnly — screening pass: computes CRA scalar per head, no storage.
+2. FluxAttnProcessorWithStorage — detailed pass: stores full attention maps on CPU.
 
-SD1.5 attention is simple: Q/K/V projections + scaled dot product. No QK-norm, no RoPE.
+Both replicate Flux's QK-norm (RMSNorm) + rotary position embeddings exactly,
+replacing F.scaled_dot_product_attention with manual Q@K^T/sqrt(d) + softmax.
 """
 
 import math
@@ -17,26 +15,102 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from scripts.roi import ROI
+from scripts.config import NUM_HEADS, HEAD_DIM
+
+
+def _get_qkv(attn, hidden_states, encoder_hidden_states=None):
+    """Replicate Flux's Q/K/V projection + QK-norm + concatenation."""
+    if attn.fused_projections:
+        query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
+            enc_q, enc_k, enc_v = attn.to_added_qkv(encoder_hidden_states).chunk(3, dim=-1)
+        else:
+            enc_q = enc_k = enc_v = None
+    else:
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+            enc_q = attn.add_q_proj(encoder_hidden_states)
+            enc_k = attn.add_k_proj(encoder_hidden_states)
+            enc_v = attn.add_v_proj(encoder_hidden_states)
+        else:
+            enc_q = enc_k = enc_v = None
+
+    # Reshape to multi-head: (B, seq, heads, head_dim)
+    query = query.unflatten(-1, (attn.heads, -1))
+    key = key.unflatten(-1, (attn.heads, -1))
+    value = value.unflatten(-1, (attn.heads, -1))
+
+    # QK-norm (RMSNorm per head)
+    query = attn.norm_q(query)
+    key = attn.norm_k(key)
+
+    # Dual-stream: normalize and concatenate encoder tokens
+    if enc_q is not None:
+        enc_q = enc_q.unflatten(-1, (attn.heads, -1))
+        enc_k = enc_k.unflatten(-1, (attn.heads, -1))
+        enc_v = enc_v.unflatten(-1, (attn.heads, -1))
+        enc_q = attn.norm_added_q(enc_q)
+        enc_k = attn.norm_added_k(enc_k)
+        # Concat: [text_tokens, image_tokens]
+        query = torch.cat([enc_q, query], dim=1)
+        key = torch.cat([enc_k, key], dim=1)
+        value = torch.cat([enc_v, value], dim=1)
+
+    return query, key, value
+
+
+def _apply_rope_and_compute_attn_weights(query, key, image_rotary_emb):
+    """Apply rotary embeddings and compute attention weights (no value multiply).
+
+    Returns attention weights: (B, heads, seq, seq) in float32.
+    """
+    # Import Flux's rotary embedding function
+    from diffusers.models.transformers.transformer_flux import apply_rotary_emb
+
+    if image_rotary_emb is not None:
+        query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+        key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+    # Transpose to (B, heads, seq, head_dim) for matmul
+    q = query.transpose(1, 2)  # (B, heads, seq_q, d)
+    k = key.transpose(1, 2)    # (B, heads, seq_k, d)
+
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    # Compute attention weights in float32 for numerical stability
+    attn_weights = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    attn_weights = F.softmax(attn_weights, dim=-1)
+
+    return attn_weights
+
+
+def _compute_attn_output(attn_weights, value):
+    """Multiply attention weights by values to get output."""
+    # value: (B, seq, heads, head_dim) -> (B, heads, seq, head_dim)
+    v = value.transpose(1, 2)
+    # attn_weights: (B, heads, seq_q, seq_k)
+    out = torch.matmul(attn_weights.to(v.dtype), v)
+    # (B, heads, seq, head_dim) -> (B, seq, heads, head_dim) -> (B, seq, inner_dim)
+    out = out.transpose(1, 2).flatten(2, 3)
+    return out.to(value.dtype)
 
 
 @dataclass
-class AttnBlockInfo:
-    """Metadata for a self-attention block."""
-    key: str            # processor dict key
-    position: str       # "down", "mid", "up"
-    block_idx: int      # index within position
-    layer_idx: int      # attention layer within block
-    resolution: int     # spatial grid size (H = W)
-    linear_idx: int     # sequential index for heatmaps
+class CRAResult:
+    """CRA scalar for one head at one timestep."""
+    block_idx: int
+    head_idx: int
+    timestep: int
+    cra_value: float
 
 
 @dataclass
 class AttentionData:
     """Container for extracted attention data across a full generation."""
-    # CRA scalars: dict[(linear_idx, head_idx, timestep)] -> float
+    # CRA scalars: dict[(block_idx, head_idx, timestep)] -> float
     cra_scalars: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
-    # Full attention maps: dict[(linear_idx, timestep)] -> tensor (heads, seq, seq) on CPU float16
+    # Full attention maps: dict[(block_idx, timestep)] -> tensor (heads, seq, seq) on CPU float16
     full_maps: Dict[Tuple[int, int], torch.Tensor] = field(default_factory=dict)
 
     def get_cra_matrix(self, timestep: int, n_blocks: int, n_heads: int) -> torch.Tensor:
@@ -56,74 +130,29 @@ class AttentionData:
         return matrices
 
 
-def discover_self_attn_blocks(unet) -> List[AttnBlockInfo]:
-    """Discover all self-attention (attn1) blocks in the SD1.5 UNet.
+class FluxAttnProcessorCRAOnly:
+    """Screening pass: compute CRA scalar per head, discard full attention map.
 
-    Returns a sorted list of AttnBlockInfo with linear indices for heatmaps.
-    """
-    from scripts.config import LATENT_SIZE
+    Replaces SDPA with manual attention computation. Computes the attention
+    output identically to the original processor, but also extracts CRA.
 
-    blocks = []
-    for key in sorted(unet.attn_processors.keys()):
-        if ".attn1.processor" not in key:
-            continue
-
-        parts = key.split(".")
-        if parts[0] == "mid_block":
-            position = "mid"
-            block_idx = 0
-            layer_idx = int(parts[2])  # mid_block.attentions.{idx}...
-        else:
-            position = parts[0].replace("_blocks", "")  # "down" or "up"
-            block_idx = int(parts[1])
-            layer_idx = int(parts[3])  # {}_blocks.{}.attentions.{idx}...
-
-        # Compute resolution from block position
-        n_down = len(unet.config.down_block_types)  # 4 for SD1.5
-        if position == "down":
-            resolution = LATENT_SIZE // (2 ** block_idx)
-        elif position == "mid":
-            resolution = LATENT_SIZE // (2 ** (n_down - 1))
-        else:  # up
-            resolution = LATENT_SIZE // (2 ** (n_down - 1 - block_idx))
-
-        blocks.append(AttnBlockInfo(
-            key=key,
-            position=position,
-            block_idx=block_idx,
-            layer_idx=layer_idx,
-            resolution=resolution,
-            linear_idx=-1,  # assigned below
-        ))
-
-    # Assign linear indices (down → mid → up order)
-    order = {"down": 0, "mid": 1, "up": 2}
-    blocks.sort(key=lambda b: (order[b.position], b.block_idx, b.layer_idx))
-    for i, block in enumerate(blocks):
-        block.linear_idx = i
-
-    return blocks
-
-
-class SD15AttnProcessorCRAOnly:
-    """Screening pass: compute CRA scalar per head for self-attention.
-
-    For cross-attention (encoder_hidden_states is not None), falls back to
-    standard SDPA without interception.
+    Args:
+        block_idx: Index of this block (0-56).
+        obj_indices: Token indices for the object ROI (in image-token space, 0-indexed).
+        ref_indices: Token indices for the reflection ROI (in image-token space, 0-indexed).
+        attention_data: Shared container to store CRA scalars.
     """
 
     def __init__(
         self,
-        linear_idx: int,
-        resolution: int,
-        obj_roi: ROI,
-        ref_roi: ROI,
+        block_idx: int,
+        obj_indices: List[int],
+        ref_indices: List[int],
         attention_data: AttentionData,
     ):
-        self.linear_idx = linear_idx
-        self.resolution = resolution
-        self.obj_roi = obj_roi
-        self.ref_roi = ref_roi
+        self.block_idx = block_idx
+        self.obj_indices = obj_indices
+        self.ref_indices = ref_indices
         self.attention_data = attention_data
         self._current_timestep = 0
 
@@ -136,113 +165,68 @@ class SD15AttnProcessorCRAOnly:
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
-        temb: torch.Tensor = None,
+        image_rotary_emb: torch.Tensor = None,
     ) -> torch.Tensor:
-        is_cross = encoder_hidden_states is not None
+        is_dual_stream = encoder_hidden_states is not None
 
-        # For cross-attention, use standard SDPA (no interception needed)
-        if is_cross:
-            return self._standard_attn(attn, hidden_states, encoder_hidden_states, attention_mask)
+        # Get Q, K, V (with QK-norm and concatenation)
+        query, key, value = _get_qkv(attn, hidden_states, encoder_hidden_states)
 
-        # Self-attention: manual computation to extract attention weights
-        residual = hidden_states
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        # Compute attention weights manually
+        attn_weights = _apply_rope_and_compute_attn_weights(query, key, image_rotary_emb)
+        # attn_weights: (B, heads, seq, seq)
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+        # Extract CRA from image-to-image quadrant
+        if is_dual_stream:
+            txt_len = encoder_hidden_states.shape[1]
+        else:
+            # Single-stream: text+image already concatenated in hidden_states
+            # We need to figure out txt_len from the sequence length
+            total_seq = hidden_states.shape[1]
+            from scripts.config import NUM_IMAGE_TOKENS
+            txt_len = total_seq - NUM_IMAGE_TOKENS
 
-        # Reshape to (B, heads, seq, head_dim)
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        batch = query.shape[0]
+        self._extract_cra(attn_weights, txt_len)
 
-        query = query.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
+        # Compute attention output (identical to original processor)
+        out = _compute_attn_output(attn_weights, value)
 
-        # Manual attention: Q @ K^T / sqrt(d) + softmax
-        scale = 1.0 / math.sqrt(head_dim)
-        attn_weights = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        if is_dual_stream:
+            encoder_hidden_states_out, hidden_states_out = out.split(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1]], dim=1
+            )
+            hidden_states_out = attn.to_out[0](hidden_states_out)
+            hidden_states_out = attn.to_out[1](hidden_states_out)
+            encoder_hidden_states_out = attn.to_add_out(encoder_hidden_states_out)
+            return hidden_states_out, encoder_hidden_states_out
+        else:
+            return out
 
-        # Extract CRA
-        self._extract_cra(attn_weights)
+    def _extract_cra(self, attn_weights: torch.Tensor, txt_len: int):
+        """Extract CRA scalar from image-to-image quadrant of attention."""
+        # attn_weights: (B, heads, seq, seq) where seq = txt_len + img_tokens
+        # Image-to-image quadrant: rows [txt_len:], cols [txt_len:]
+        img_attn = attn_weights[:, :, txt_len:, txt_len:]  # (B, heads, img, img)
 
-        # Compute output
-        hidden_states = torch.matmul(attn_weights.to(value.dtype), value)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch, -1, inner_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        # Output projection
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-        hidden_states = hidden_states / attn.rescale_output_factor
-
-        return hidden_states
-
-    def _extract_cra(self, attn_weights: torch.Tensor):
-        """Extract CRA scalar from self-attention weights."""
-        obj_idx = torch.tensor(
-            self.obj_roi.token_indices(self.resolution),
-            device=attn_weights.device,
-        )
-        ref_idx = torch.tensor(
-            self.ref_roi.token_indices(self.resolution),
-            device=attn_weights.device,
-        )
+        obj_idx = torch.tensor(self.obj_indices, device=attn_weights.device)
+        ref_idx = torch.tensor(self.ref_indices, device=attn_weights.device)
 
         for h in range(attn_weights.shape[1]):
-            # CRA: mean attention from reflection queries to object keys
-            cross_attn = attn_weights[0, h][ref_idx][:, obj_idx]
+            # CRA: average attention from reflection tokens to object tokens
+            # ref_tokens (query) attending to obj_tokens (key)
+            cross_attn = img_attn[0, h][ref_idx][:, obj_idx]  # (n_ref, n_obj)
             cra = cross_attn.mean().item()
             self.attention_data.cra_scalars[
-                (self.linear_idx, h, self._current_timestep)
+                (self.block_idx, h, self._current_timestep)
             ] = cra
 
-    @staticmethod
-    def _standard_attn(attn, hidden_states, encoder_hidden_states, attention_mask):
-        """Standard SDPA for cross-attention (no interception)."""
-        residual = hidden_states
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+class FluxAttnProcessorWithStorage(FluxAttnProcessorCRAOnly):
+    """Detailed pass: stores full attention maps on CPU in float16.
 
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        batch = query.shape[0]
-
-        query = query.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask
-        )
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch, -1, inner_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-        hidden_states = hidden_states / attn.rescale_output_factor
-
-        return hidden_states
-
-
-class SD15AttnProcessorWithStorage(SD15AttnProcessorCRAOnly):
-    """Detailed pass: stores full self-attention maps on CPU in float16."""
+    Only install on top-K candidate blocks at peak timestep.
+    One full map per block: (heads, seq, seq) ≈ 108MB at float16.
+    """
 
     def __call__(
         self,
@@ -250,145 +234,126 @@ class SD15AttnProcessorWithStorage(SD15AttnProcessorCRAOnly):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
-        temb: torch.Tensor = None,
+        image_rotary_emb: torch.Tensor = None,
     ) -> torch.Tensor:
-        is_cross = encoder_hidden_states is not None
+        is_dual_stream = encoder_hidden_states is not None
 
-        if is_cross:
-            return self._standard_attn(attn, hidden_states, encoder_hidden_states, attention_mask)
+        query, key, value = _get_qkv(attn, hidden_states, encoder_hidden_states)
+        attn_weights = _apply_rope_and_compute_attn_weights(query, key, image_rotary_emb)
 
-        residual = hidden_states
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        batch = query.shape[0]
-
-        query = query.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch, -1, attn.heads, head_dim).transpose(1, 2)
-
-        scale = 1.0 / math.sqrt(head_dim)
-        attn_weights = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        if is_dual_stream:
+            txt_len = encoder_hidden_states.shape[1]
+        else:
+            total_seq = hidden_states.shape[1]
+            from scripts.config import NUM_IMAGE_TOKENS
+            txt_len = total_seq - NUM_IMAGE_TOKENS
 
         # Extract CRA
-        self._extract_cra(attn_weights)
+        self._extract_cra(attn_weights, txt_len)
 
-        # Store full attention map on CPU
+        # Store full attention map on CPU (float16 to save memory)
         self.attention_data.full_maps[
-            (self.linear_idx, self._current_timestep)
+            (self.block_idx, self._current_timestep)
         ] = attn_weights[0].to(torch.float16).cpu()
 
         # Compute output
-        hidden_states = torch.matmul(attn_weights.to(value.dtype), value)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch, -1, inner_dim)
-        hidden_states = hidden_states.to(query.dtype)
+        out = _compute_attn_output(attn_weights, value)
 
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+        if is_dual_stream:
+            encoder_hidden_states_out, hidden_states_out = out.split(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1]], dim=1
+            )
+            hidden_states_out = attn.to_out[0](hidden_states_out)
+            hidden_states_out = attn.to_out[1](hidden_states_out)
+            encoder_hidden_states_out = attn.to_add_out(encoder_hidden_states_out)
+            return hidden_states_out, encoder_hidden_states_out
+        else:
+            return out
 
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-        hidden_states = hidden_states / attn.rescale_output_factor
 
-        return hidden_states
+def get_processor_key(block_idx: int) -> str:
+    """Get the processor dict key for a given block index.
+
+    Blocks 0-18: dual-stream (transformer_blocks)
+    Blocks 19-56: single-stream (single_transformer_blocks)
+    """
+    from scripts.config import NUM_DUAL_STREAM_BLOCKS
+    if block_idx < NUM_DUAL_STREAM_BLOCKS:
+        return f"transformer_blocks.{block_idx}.attn.processor"
+    else:
+        single_idx = block_idx - NUM_DUAL_STREAM_BLOCKS
+        return f"single_transformer_blocks.{single_idx}.attn.processor"
 
 
 def install_cra_processors(
-    unet,
-    obj_roi: ROI,
-    ref_roi: ROI,
+    transformer,
+    obj_indices: List[int],
+    ref_indices: List[int],
     attention_data: AttentionData,
-) -> Tuple[List[AttnBlockInfo], Dict]:
-    """Install CRA-only processors on all self-attention blocks.
+) -> Dict[str, FluxAttnProcessorCRAOnly]:
+    """Install CRA-only processors on all attention blocks.
 
-    Cross-attention blocks (attn2) get default SDPA processors.
-
-    Returns:
-        (block_infos, processors_dict) for timestep management.
+    Returns dict of processor_key -> processor for timestep management.
     """
-    block_infos = discover_self_attn_blocks(unet)
-    block_info_map = {b.key: b for b in block_infos}
-
+    from scripts.config import NUM_BLOCKS
     processors = {}
-    custom_processors = {}
+    for block_idx in range(NUM_BLOCKS):
+        key = get_processor_key(block_idx)
+        proc = FluxAttnProcessorCRAOnly(
+            block_idx=block_idx,
+            obj_indices=obj_indices,
+            ref_indices=ref_indices,
+            attention_data=attention_data,
+        )
+        processors[key] = proc
 
-    for key in unet.attn_processors.keys():
-        if key in block_info_map:
-            info = block_info_map[key]
-            proc = SD15AttnProcessorCRAOnly(
-                linear_idx=info.linear_idx,
-                resolution=info.resolution,
-                obj_roi=obj_roi,
-                ref_roi=ref_roi,
-                attention_data=attention_data,
-            )
-            processors[key] = proc
-            custom_processors[key] = proc
-        else:
-            # Cross-attention or non-attention: use default
-            from diffusers.models.attention_processor import AttnProcessor2_0
-            processors[key] = AttnProcessor2_0()
-
-    unet.set_attn_processor(processors)
-    return block_infos, custom_processors
+    transformer.set_attn_processor(processors)
+    return processors
 
 
 def install_storage_processors(
-    unet,
-    candidate_linear_indices: List[int],
-    obj_roi: ROI,
-    ref_roi: ROI,
+    transformer,
+    candidate_blocks: List[int],
+    obj_indices: List[int],
+    ref_indices: List[int],
     attention_data: AttentionData,
-) -> Tuple[List[AttnBlockInfo], Dict]:
-    """Install storage processors on candidate blocks, CRA-only on the rest."""
-    block_infos = discover_self_attn_blocks(unet)
-    block_info_map = {b.key: b for b in block_infos}
+) -> Dict[str, FluxAttnProcessorWithStorage]:
+    """Install storage processors on candidate blocks, CRA-only on the rest.
 
+    Args:
+        candidate_blocks: Block indices to store full attention maps for.
+    """
+    from scripts.config import NUM_BLOCKS
     processors = {}
-    custom_processors = {}
+    storage_processors = {}
 
-    for key in unet.attn_processors.keys():
-        if key in block_info_map:
-            info = block_info_map[key]
-            if info.linear_idx in candidate_linear_indices:
-                proc = SD15AttnProcessorWithStorage(
-                    linear_idx=info.linear_idx,
-                    resolution=info.resolution,
-                    obj_roi=obj_roi,
-                    ref_roi=ref_roi,
-                    attention_data=attention_data,
-                )
-            else:
-                proc = SD15AttnProcessorCRAOnly(
-                    linear_idx=info.linear_idx,
-                    resolution=info.resolution,
-                    obj_roi=obj_roi,
-                    ref_roi=ref_roi,
-                    attention_data=attention_data,
-                )
-            processors[key] = proc
-            custom_processors[key] = proc
+    for block_idx in range(NUM_BLOCKS):
+        key = get_processor_key(block_idx)
+        if block_idx in candidate_blocks:
+            proc = FluxAttnProcessorWithStorage(
+                block_idx=block_idx,
+                obj_indices=obj_indices,
+                ref_indices=ref_indices,
+                attention_data=attention_data,
+            )
+            storage_processors[key] = proc
         else:
-            from diffusers.models.attention_processor import AttnProcessor2_0
-            processors[key] = AttnProcessor2_0()
+            proc = FluxAttnProcessorCRAOnly(
+                block_idx=block_idx,
+                obj_indices=obj_indices,
+                ref_indices=ref_indices,
+                attention_data=attention_data,
+            )
+        processors[key] = proc
 
-    unet.set_attn_processor(processors)
-    return block_infos, custom_processors
+    transformer.set_attn_processor(processors)
+    return storage_processors
 
 
-def restore_default_processors(unet):
-    """Restore original SD1.5 attention processors."""
-    from diffusers.models.attention_processor import AttnProcessor2_0
-    unet.set_attn_processor(AttnProcessor2_0())
+def restore_default_processors(transformer):
+    """Restore original Flux attention processors."""
+    from diffusers.models.transformers.transformer_flux import FluxAttnProcessor
+    transformer.set_attn_processor(FluxAttnProcessor())
 
 
 def set_all_timesteps(processors: Dict, timestep: int):

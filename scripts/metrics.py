@@ -11,15 +11,44 @@ import torch
 import numpy as np
 
 from scripts.attention_extraction import AttentionData
-from scripts.config import NUM_HEADS, NUM_INFERENCE_STEPS
+from scripts.config import NUM_BLOCKS, NUM_HEADS, NUM_INFERENCE_STEPS
 
 
 # ── Step 1: Cross-Region Attention & Selectivity ───────────────────────────────
 
+def compute_cra(
+    attn_map: torch.Tensor,
+    obj_indices: List[int],
+    ref_indices: List[int],
+    txt_len: int,
+) -> torch.Tensor:
+    """Compute CRA per head from a full attention map.
+
+    Args:
+        attn_map: (heads, seq, seq) attention weights.
+        obj_indices: Object ROI token indices (image-space, 0-indexed).
+        ref_indices: Reflection ROI token indices (image-space, 0-indexed).
+        txt_len: Number of text tokens (to offset into image quadrant).
+
+    Returns:
+        (heads,) tensor of CRA values.
+    """
+    # Shift indices to account for text tokens
+    ref_abs = [r + txt_len for r in ref_indices]
+    obj_abs = [o + txt_len for o in obj_indices]
+
+    ref_idx = torch.tensor(ref_abs)
+    obj_idx = torch.tensor(obj_abs)
+
+    # CRA: mean attention from reflection queries to object keys
+    cross_attn = attn_map[:, ref_idx][:, :, obj_idx]  # (heads, n_ref, n_obj)
+    return cross_attn.mean(dim=(1, 2))  # (heads,)
+
+
 def compute_selectivity_matrix(
     mirror_data: List[AttentionData],
     nonmirror_data: List[AttentionData],
-    n_blocks: int,
+    n_blocks: int = NUM_BLOCKS,
     n_heads: int = NUM_HEADS,
     n_timesteps: int = NUM_INFERENCE_STEPS,
 ) -> torch.Tensor:
@@ -27,15 +56,20 @@ def compute_selectivity_matrix(
 
     S = mean(CRA_mirror) - mean(CRA_nonmirror)
 
+    Args:
+        mirror_data: List of AttentionData from mirror images.
+        nonmirror_data: List of AttentionData from non-mirror images.
+
     Returns:
         (n_blocks, n_heads) selectivity matrix.
     """
     def _avg_cra_matrix(data_list):
         matrices = []
         for data in data_list:
+            # Average over timesteps
             m = data.get_all_cra_matrices(n_blocks, n_heads, n_timesteps)
-            matrices.append(m.mean(dim=0))  # average over timesteps -> (blocks, heads)
-        return torch.stack(matrices).mean(dim=0)  # average over samples
+            matrices.append(m.mean(dim=0))  # (blocks, heads)
+        return torch.stack(matrices).mean(dim=0)
 
     mirror_avg = _avg_cra_matrix(mirror_data)
     nonmirror_avg = _avg_cra_matrix(nonmirror_data)
@@ -48,7 +82,7 @@ def rank_candidates(
 ) -> List[Tuple[int, int, float]]:
     """Rank heads by selectivity score.
 
-    Returns list of (linear_block_idx, head_idx, score) sorted descending.
+    Returns list of (block_idx, head_idx, score) sorted descending.
     """
     flat = selectivity_matrix.flatten()
     top_indices = torch.argsort(flat, descending=True)[:top_k]
@@ -69,8 +103,10 @@ def rank_candidates(
 def compute_attention_entropy(attn_map: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
     """Compute entropy of attention distribution per head.
 
+    H(h) = -sum_ij A * log(A)
+
     Args:
-        attn_map: (heads, seq, seq) attention weights.
+        attn_map: (heads, seq, seq) attention weights (probabilities along last dim).
 
     Returns:
         (heads,) entropy values.
@@ -87,7 +123,7 @@ def compute_entropy_from_data(
 ) -> dict:
     """Compute mean entropy per candidate block/head from stored full attention maps.
 
-    Returns dict[(linear_block_idx, head_idx)] -> mean_entropy
+    Returns dict[(block_idx, head_idx)] -> mean_entropy
     """
     entropy_sums = {}
     entropy_counts = {}
@@ -96,6 +132,7 @@ def compute_entropy_from_data(
         for (block_idx, timestep), attn_map in data.full_maps.items():
             if block_idx not in candidate_blocks:
                 continue
+            # attn_map: (heads, seq, seq)
             H = compute_attention_entropy(attn_map.float())
             for h in range(n_heads):
                 key = (block_idx, h)
@@ -111,9 +148,16 @@ def compute_hies(
     H_nonmirror: float,
     H_max: float = None,
 ) -> float:
-    """Compute HIES score: S * (H_nonmirror - H_mirror) / H_max.
+    """Compute HIES score: S × (H_nonmirror - H_mirror) / H_max.
 
-    Reflection heads should have high selectivity AND lower entropy on mirror images.
+    Reflection heads should have high selectivity AND lower entropy on mirror images
+    (more focused attention), yielding positive HIES.
+
+    Args:
+        selectivity: S(h, l) = CRA_mirror - CRA_nonmirror
+        H_mirror: Mean entropy on mirror images
+        H_nonmirror: Mean entropy on non-mirror images
+        H_max: Maximum possible entropy (log(seq_len)). If None, uses max(H_mirror, H_nonmirror).
     """
     if H_max is None:
         H_max = max(H_mirror, H_nonmirror, 1e-10)
@@ -128,7 +172,10 @@ def compute_temporal_cra(
     head_idx: int,
     n_timesteps: int = NUM_INFERENCE_STEPS,
 ) -> List[float]:
-    """Get CRA values across timesteps for a specific head."""
+    """Get CRA values across timesteps for a specific head.
+
+    Returns list of CRA values, one per timestep.
+    """
     return [
         data.cra_scalars.get((block_idx, head_idx, t), 0.0)
         for t in range(n_timesteps)
@@ -155,7 +202,9 @@ def compute_temporal_profiles(
     return profiles
 
 
-def identify_peak_timestep(temporal_profiles: dict) -> int:
+def identify_peak_timestep(
+    temporal_profiles: dict,
+) -> int:
     """Find the timestep where CRA is highest on average across candidates."""
     n_timesteps = len(next(iter(temporal_profiles.values())))
     timestep_means = np.zeros(n_timesteps)
