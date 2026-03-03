@@ -20,7 +20,7 @@ def load_flux_pipeline(quantize_nf4: bool = True, cpu_offload: bool = True) -> F
     }
 
     if quantize_nf4:
-        from diffusers import BitsAndBytesConfig, PipelineQuantizationConfig
+        from diffusers import PipelineQuantizationConfig
         nf4_config = PipelineQuantizationConfig(
             quant_backend="bitsandbytes_4bit",
             quant_kwargs={
