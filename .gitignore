@@ -10,8 +10,6 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
-# Experiments (generated at runtime)
-experiments/
 
 # Models
 models/
