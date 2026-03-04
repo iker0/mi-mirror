@@ -62,6 +62,12 @@ NON_MIRROR_PROMPTS = [
     "a bird perched on the left with a clock on the right side of the wall",
 ]
 
+# ── Prompt objects (1:1 with MIRROR_PROMPTS / NON_MIRROR_PROMPTS by index) ─────
+PROMPT_OBJECTS = [
+    "cat", "woman", "red ball", "dog",
+    "vase of flowers", "person", "teddy bear", "bird",
+]
+
 # ── Experiment parameters ──────────────────────────────────────────────────────
 TOP_K_CANDIDATES = 10  # Number of candidate heads to investigate in detail
 TIMESTEPS_TO_CAPTURE = list(range(NUM_INFERENCE_STEPS))  # [0, 1, 2, 3]

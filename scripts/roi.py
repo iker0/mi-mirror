@@ -5,11 +5,17 @@ Token indices are row-major: token_idx = row * GRID_W + col.
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
+from PIL import Image
 
 from scripts.config import GRID_H, GRID_W, TOTAL_DOWNSCALE, RESOLUTION, NUM_IMAGE_TOKENS
+
+# ── CLIPSeg lazy-loaded globals ───────────────────────────────────────────────
+_clipseg_processor = None
+_clipseg_model = None
 
 
 @dataclass
@@ -114,3 +120,107 @@ def bbox_roi(name: str, x0: int, y0: int, x1: int, y1: int) -> ROI:
 def get_default_rois() -> Tuple[ROI, ROI]:
     """Get default object/reflection ROIs (left/right vertical split)."""
     return split_vertical(0.5)
+
+
+# ── CLIPSeg-based segmentation ────────────────────────────────────────────────
+
+def _load_clipseg():
+    """Lazy-load CLIPSeg model and processor (cached as module globals)."""
+    global _clipseg_processor, _clipseg_model
+    if _clipseg_model is None:
+        from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+        _clipseg_processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+        _clipseg_model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+        _clipseg_model.eval()
+    return _clipseg_processor, _clipseg_model
+
+
+def get_roi(
+    object_name: str,
+    image: Image.Image,
+    threshold: float = 0.5,
+    roi_name: Optional[str] = None,
+) -> ROI:
+    """Segment an object in an image using CLIPSeg and return token-space ROI.
+
+    Args:
+        object_name: Text query for CLIPSeg (e.g. "cat", "red ball").
+        image: PIL image to segment.
+        threshold: Fraction of max probability to threshold at.
+        roi_name: Name for the ROI (defaults to object_name).
+
+    Returns:
+        ROI with token indices where the object was detected.
+
+    Raises:
+        ValueError: If no tokens survive thresholding.
+    """
+    processor, model = _load_clipseg()
+
+    inputs = processor(text=[object_name], images=[image], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        logits = model(**inputs).logits  # (1, H, W)
+
+    # Sigmoid → probability map
+    prob_map = torch.sigmoid(logits[0])  # (H, W)
+
+    # Resize to token grid via bilinear interpolation
+    prob_grid = torch.nn.functional.interpolate(
+        prob_map.unsqueeze(0).unsqueeze(0),  # (1, 1, H, W)
+        size=(GRID_H, GRID_W),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze()  # (GRID_H, GRID_W)
+
+    # Threshold at threshold * max_prob
+    max_prob = prob_grid.max().item()
+    binary_mask = prob_grid >= (threshold * max_prob)
+
+    token_indices = binary_mask.nonzero(as_tuple=False)  # (N, 2) — row, col
+    if token_indices.numel() == 0:
+        raise ValueError(f"No tokens survived thresholding for '{object_name}'")
+
+    indices = (token_indices[:, 0] * GRID_W + token_indices[:, 1]).tolist()
+
+    return ROI(name=roi_name or object_name, token_indices=sorted(indices))
+
+
+def get_object_and_reflection_rois(
+    image: Image.Image,
+    object_name: str,
+    threshold: float = 0.5,
+) -> Tuple[ROI, ROI]:
+    """Get separate object and reflection ROIs by splitting CLIPSeg mask at midpoint.
+
+    Tokens in the left half (col < 16) are assigned to the object ROI,
+    tokens in the right half (col >= 16) to the reflection ROI.
+    Falls back to a 50/50 vertical split if one side is empty.
+
+    Args:
+        image: PIL image to segment.
+        object_name: Text query for CLIPSeg.
+        threshold: Fraction of max probability to threshold at.
+
+    Returns:
+        (object_roi, reflection_roi) tuple.
+    """
+    full_roi = get_roi(object_name, image, threshold=threshold, roi_name=object_name)
+
+    mid_col = GRID_W // 2
+    left_indices = []
+    right_indices = []
+    for idx in full_roi.token_indices:
+        col = idx % GRID_W
+        if col < mid_col:
+            left_indices.append(idx)
+        else:
+            right_indices.append(idx)
+
+    # Fall back to half-split if one side is empty
+    if not left_indices or not right_indices:
+        return split_vertical(0.5)
+
+    return (
+        ROI(name=f"{object_name}_object", token_indices=left_indices),
+        ROI(name=f"{object_name}_reflection", token_indices=right_indices),
+    )
