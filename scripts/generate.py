@@ -11,6 +11,7 @@ from scripts.attention_extraction import (
     AttentionData,
     FluxAttnProcessorCRAOnly,
     FluxAttnProcessorWithStorage,
+    install_ablation_processors,
     install_cra_processors,
     install_storage_processors,
     restore_default_processors,
@@ -148,6 +149,38 @@ def generate_baseline(
         num_inference_steps=num_inference_steps,
         generator=generator,
     ).images[0]
+    return image
+
+
+def generate_with_ablation(
+    pipe: FluxPipeline,
+    prompt: str,
+    seed: int,
+    ablation_targets: List[Tuple[int, List[int]]],
+    num_inference_steps: int = NUM_INFERENCE_STEPS,
+    resolution: int = RESOLUTION,
+) -> Image.Image:
+    """Generate an image with specified heads zero-ablated.
+
+    Args:
+        ablation_targets: List of (block_idx, [head_indices]) to ablate.
+
+    Returns:
+        Generated image with ablated heads.
+    """
+    transformer = pipe.transformer
+    install_ablation_processors(transformer, ablation_targets)
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    image = pipe(
+        prompt=prompt,
+        height=resolution,
+        width=resolution,
+        num_inference_steps=num_inference_steps,
+        generator=generator,
+    ).images[0]
+
+    restore_default_processors(transformer)
     return image
 
 

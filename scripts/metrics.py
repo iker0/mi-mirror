@@ -3,12 +3,15 @@
 Step 1: Selectivity Score — CRA_mirror - CRA_nonmirror
 Step 2: Attention Entropy + HIES score
 Step 3: Temporal profiling (CRA vs timestep)
+Step 5: Reflection quality degradation (causal validation)
+Step 6: Superadditivity (circuit composition)
 """
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import numpy as np
+from PIL import Image
 
 from scripts.attention_extraction import AttentionData
 from scripts.config import NUM_BLOCKS, NUM_HEADS, NUM_INFERENCE_STEPS
@@ -212,3 +215,119 @@ def identify_peak_timestep(
         timestep_means += np.array(profile)
     timestep_means /= len(temporal_profiles)
     return int(np.argmax(timestep_means))
+
+
+# ── Step 5: Causal Validation — Reflection Quality Degradation ──────────────
+
+def _image_to_array(img: Image.Image) -> np.ndarray:
+    """Convert PIL image to float64 numpy array in [0, 1]."""
+    return np.asarray(img).astype(np.float64) / 255.0
+
+
+def _ssim_simple(
+    img1: np.ndarray,
+    img2: np.ndarray,
+    C1: float = (0.01 * 255) ** 2,
+    C2: float = (0.03 * 255) ** 2,
+) -> float:
+    """Compute mean SSIM between two images (H, W, C) in [0, 255] scale.
+
+    Uses the standard SSIM formula with 8x8 block means.
+    """
+    # Work in [0, 255] range for standard C1/C2
+    a = img1 * 255.0
+    b = img2 * 255.0
+
+    mu1 = a.mean()
+    mu2 = b.mean()
+    sigma1_sq = ((a - mu1) ** 2).mean()
+    sigma2_sq = ((b - mu2) ** 2).mean()
+    sigma12 = ((a - mu1) * (b - mu2)).mean()
+
+    ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return float(ssim)
+
+
+def compute_reflection_quality(
+    original_img: Image.Image,
+    ablated_img: Image.Image,
+    ref_roi: "ROI",
+    obj_roi: "ROI",
+    resolution: int = None,
+) -> Dict[str, float]:
+    """Compare original vs ablated image quality in reflection and object regions.
+
+    Args:
+        original_img: Baseline image (no ablation).
+        ablated_img: Image generated with head(s) ablated.
+        ref_roi: Reflection region ROI.
+        obj_roi: Object region ROI.
+        resolution: Image resolution (inferred from image if None).
+
+    Returns:
+        Dict with ssim_reflection, ssim_object, ssim_full, mse_reflection,
+        mse_object, mse_full, and degradation_ratio.
+    """
+    if resolution is None:
+        resolution = original_img.size[0]
+
+    orig = _image_to_array(original_img.resize((resolution, resolution)))
+    ablated = _image_to_array(ablated_img.resize((resolution, resolution)))
+
+    ref_mask = ref_roi.to_pixel_mask(resolution)
+    obj_mask = obj_roi.to_pixel_mask(resolution)
+
+    # Extract masked regions
+    ref_orig = orig[ref_mask]
+    ref_ablated = ablated[ref_mask]
+    obj_orig = orig[obj_mask]
+    obj_ablated = ablated[obj_mask]
+
+    # MSE
+    mse_ref = float(((ref_orig - ref_ablated) ** 2).mean())
+    mse_obj = float(((obj_orig - obj_ablated) ** 2).mean())
+    mse_full = float(((orig - ablated) ** 2).mean())
+
+    # SSIM (computed on the full masked region as flat arrays reshaped to pseudo-image)
+    ssim_ref = _ssim_simple(ref_orig.reshape(1, -1, 1), ref_ablated.reshape(1, -1, 1))
+    ssim_obj = _ssim_simple(obj_orig.reshape(1, -1, 1), obj_ablated.reshape(1, -1, 1))
+    ssim_full = _ssim_simple(orig, ablated)
+
+    # Degradation ratio: how much worse is reflection degradation vs object degradation
+    # Higher = more specific to reflection (what we want for reflection heads)
+    eps = 1e-10
+    degradation_ratio = mse_ref / (mse_obj + eps)
+
+    return {
+        "ssim_reflection": ssim_ref,
+        "ssim_object": ssim_obj,
+        "ssim_full": ssim_full,
+        "mse_reflection": mse_ref,
+        "mse_object": mse_obj,
+        "mse_full": mse_full,
+        "degradation_ratio": degradation_ratio,
+    }
+
+
+# ── Step 6: Circuit Composition — Superadditivity ───────────────────────────
+
+def compute_superadditivity(
+    individual_effects: List[float],
+    joint_effect: float,
+) -> float:
+    """Compute superadditivity: joint effect minus sum of individual effects.
+
+    Positive = heads form a synergistic circuit (joint ablation is worse than
+    the sum of individual ablations).
+    Near-zero = heads work independently.
+
+    Args:
+        individual_effects: List of degradation values from ablating each head alone.
+        joint_effect: Degradation value from ablating all heads simultaneously.
+
+    Returns:
+        Superadditivity score.
+    """
+    return joint_effect - sum(individual_effects)

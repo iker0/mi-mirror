@@ -350,6 +350,97 @@ def install_storage_processors(
     return storage_processors
 
 
+class FluxAttnProcessorWithAblation:
+    """Ablation processor: zeros out specified heads' output contributions.
+
+    Used for causal validation — if ablating a head degrades reflection quality
+    but not overall image quality, the head is causally involved in reflection.
+
+    Args:
+        block_idx: Index of this block (0-56).
+        ablate_heads: Head indices to zero out within this block.
+    """
+
+    def __init__(self, block_idx: int, ablate_heads: List[int]):
+        self.block_idx = block_idx
+        self.ablate_heads = ablate_heads
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        image_rotary_emb: torch.Tensor = None,
+    ) -> torch.Tensor:
+        is_dual_stream = encoder_hidden_states is not None
+
+        query, key, value = _get_qkv(attn, hidden_states, encoder_hidden_states)
+        attn_weights = _apply_rope_and_compute_attn_weights(query, key, image_rotary_emb)
+        out = _compute_attn_output_with_ablation(attn_weights, value, self.ablate_heads)
+
+        if is_dual_stream:
+            encoder_hidden_states_out, hidden_states_out = out.split(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1]], dim=1
+            )
+            hidden_states_out = attn.to_out[0](hidden_states_out)
+            hidden_states_out = attn.to_out[1](hidden_states_out)
+            encoder_hidden_states_out = attn.to_add_out(encoder_hidden_states_out)
+            return hidden_states_out, encoder_hidden_states_out
+        else:
+            return out
+
+
+def _compute_attn_output_with_ablation(
+    attn_weights: torch.Tensor,
+    value: torch.Tensor,
+    ablate_heads: List[int],
+) -> torch.Tensor:
+    """Like _compute_attn_output but zeros ablated heads before flattening.
+
+    Args:
+        attn_weights: (B, heads, seq_q, seq_k)
+        value: (B, seq, heads, head_dim)
+        ablate_heads: Head indices to zero out.
+    """
+    v = value.transpose(1, 2)  # (B, heads, seq, head_dim)
+    out = torch.matmul(attn_weights.to(v.dtype), v)  # (B, heads, seq, head_dim)
+    # Zero ablated heads
+    out[:, ablate_heads, :, :] = 0
+    # (B, heads, seq, head_dim) -> (B, seq, heads, head_dim) -> (B, seq, inner_dim)
+    out = out.transpose(1, 2).flatten(2, 3)
+    return out.to(value.dtype)
+
+
+def install_ablation_processors(
+    transformer,
+    ablation_targets: List[Tuple[int, List[int]]],
+) -> None:
+    """Install ablation processors on specified blocks, default Flux processors elsewhere.
+
+    Args:
+        transformer: The Flux transformer model.
+        ablation_targets: List of (block_idx, [head_indices]) to ablate.
+    """
+    from diffusers.models.transformers.transformer_flux import FluxAttnProcessor
+    from scripts.config import NUM_BLOCKS
+
+    target_map = {block_idx: heads for block_idx, heads in ablation_targets}
+    processors = {}
+
+    for block_idx in range(NUM_BLOCKS):
+        key = get_processor_key(block_idx)
+        if block_idx in target_map:
+            processors[key] = FluxAttnProcessorWithAblation(
+                block_idx=block_idx,
+                ablate_heads=target_map[block_idx],
+            )
+        else:
+            processors[key] = FluxAttnProcessor()
+
+    transformer.set_attn_processor(processors)
+
+
 def restore_default_processors(transformer):
     """Restore original Flux attention processors."""
     from diffusers.models.transformers.transformer_flux import FluxAttnProcessor

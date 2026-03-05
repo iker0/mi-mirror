@@ -274,3 +274,197 @@ def plot_attention_grid(
     fig.suptitle(title, fontsize=14)
     fig.tight_layout()
     return fig
+
+
+# ── Step 5: Ablation Comparison Visualizations ──────────────────────────────
+
+def plot_ablation_comparison(
+    original: Image.Image,
+    ablated_images: Dict[Tuple[int, int], Image.Image],
+    title: str = "Ablation Comparison",
+    figsize: Tuple[int, int] = (20, 4),
+) -> plt.Figure:
+    """Side-by-side comparison: original vs ablated images.
+
+    Args:
+        original: Baseline image.
+        ablated_images: Dict of (block_idx, head_idx) -> ablated image.
+    """
+    n = len(ablated_images) + 1
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
+    if n == 1:
+        axes = [axes]
+
+    axes[0].imshow(original)
+    axes[0].set_title("Original", fontsize=11)
+    axes[0].axis("off")
+
+    for i, ((b, h), img) in enumerate(ablated_images.items(), 1):
+        axes[i].imshow(img)
+        axes[i].set_title(f"Ablate B{b}H{h}", fontsize=11)
+        axes[i].axis("off")
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+def plot_degradation_bars(
+    metrics_per_head: Dict[Tuple[int, int], dict],
+    title: str = "Reflection vs Object Degradation (MSE)",
+    figsize: Tuple[int, int] = (12, 5),
+) -> plt.Figure:
+    """Bar chart of MSE for reflection vs object region per ablated head.
+
+    Args:
+        metrics_per_head: Dict of (block_idx, head_idx) -> metrics dict from
+            compute_reflection_quality.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    labels = [f"B{b}H{h}" for b, h in metrics_per_head]
+    ref_mse = [m["mse_reflection"] for m in metrics_per_head.values()]
+    obj_mse = [m["mse_object"] for m in metrics_per_head.values()]
+    ref_ssim = [m["ssim_reflection"] for m in metrics_per_head.values()]
+    obj_ssim = [m["ssim_object"] for m in metrics_per_head.values()]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    # MSE
+    axes[0].bar(x - width / 2, ref_mse, width, label="Reflection", color="#e74c3c", alpha=0.8)
+    axes[0].bar(x + width / 2, obj_mse, width, label="Object", color="#3498db", alpha=0.8)
+    axes[0].set_ylabel("MSE")
+    axes[0].set_title("MSE by Region")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels, rotation=45)
+    axes[0].legend()
+
+    # SSIM
+    axes[1].bar(x - width / 2, ref_ssim, width, label="Reflection", color="#e74c3c", alpha=0.8)
+    axes[1].bar(x + width / 2, obj_ssim, width, label="Object", color="#3498db", alpha=0.8)
+    axes[1].set_ylabel("SSIM")
+    axes[1].set_title("SSIM by Region")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=45)
+    axes[1].legend()
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+# ── Step 6: Circuit Composition Visualizations ──────────────────────────────
+
+def plot_superadditivity_heatmap(
+    pairwise_scores: Dict[Tuple[Tuple[int, int], Tuple[int, int]], float],
+    title: str = "Pairwise Superadditivity",
+    figsize: Tuple[int, int] = (8, 6),
+) -> plt.Figure:
+    """Heatmap of pairwise superadditivity scores.
+
+    Args:
+        pairwise_scores: Dict of ((b1,h1), (b2,h2)) -> superadditivity score.
+    """
+    # Collect unique heads
+    heads = sorted(set(
+        h for pair in pairwise_scores for h in pair
+    ))
+    n = len(heads)
+    head_to_idx = {h: i for i, h in enumerate(heads)}
+    matrix = np.zeros((n, n))
+
+    for (h1, h2), score in pairwise_scores.items():
+        i, j = head_to_idx[h1], head_to_idx[h2]
+        matrix[i, j] = score
+        matrix[j, i] = score
+
+    fig, ax = plt.subplots(figsize=figsize)
+    vmax = max(abs(matrix.min()), abs(matrix.max())) or 1.0
+    im = ax.imshow(matrix, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+
+    labels = [f"B{b}H{h}" for b, h in heads]
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels)
+
+    # Annotate cells
+    for i in range(n):
+        for j in range(n):
+            if i != j and matrix[i, j] != 0:
+                ax.text(j, i, f"{matrix[i, j]:.4f}", ha="center", va="center", fontsize=8)
+
+    plt.colorbar(im, ax=ax, label="Superadditivity")
+    ax.set_title(title, fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+def plot_circuit_diagram(
+    pairwise_scores: Dict[Tuple[Tuple[int, int], Tuple[int, int]], float],
+    threshold: float = 0.0,
+    title: str = "Reflection Head Circuit",
+    figsize: Tuple[int, int] = (10, 6),
+) -> plt.Figure:
+    """Network diagram showing head interactions (edges for superadditive pairs).
+
+    Args:
+        pairwise_scores: Dict of ((b1,h1), (b2,h2)) -> superadditivity score.
+        threshold: Only draw edges for scores above this threshold.
+    """
+    heads = sorted(set(h for pair in pairwise_scores for h in pair))
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Position nodes by block index (y) and head index (x)
+    blocks = sorted(set(b for b, h in heads))
+    block_to_y = {b: i for i, b in enumerate(blocks)}
+
+    # Count heads per block for x spacing
+    heads_per_block = {}
+    for b, h in heads:
+        heads_per_block.setdefault(b, []).append(h)
+
+    positions = {}
+    for b, h in heads:
+        y = block_to_y[b]
+        hlist = sorted(heads_per_block[b])
+        x = hlist.index(h) - (len(hlist) - 1) / 2
+        positions[(b, h)] = (x, -y)
+
+    # Draw edges
+    for (h1, h2), score in pairwise_scores.items():
+        if score > threshold:
+            x1, y1 = positions[h1]
+            x2, y2 = positions[h2]
+            linewidth = 1 + 5 * abs(score) / (max(abs(s) for s in pairwise_scores.values()) or 1)
+            color = "#2ecc71" if score > 0 else "#e74c3c"
+            ax.plot([x1, x2], [y1, y2], color=color, linewidth=linewidth, alpha=0.6, zorder=1)
+
+    # Draw nodes
+    for (b, h), (x, y) in positions.items():
+        is_dual = b < NUM_DUAL_STREAM_BLOCKS
+        color = "#e74c3c" if is_dual else "#3498db"
+        ax.scatter(x, y, s=300, c=color, zorder=2, edgecolors="black", linewidth=1)
+        ax.annotate(f"B{b}H{h}", (x, y), ha="center", va="center", fontsize=7,
+                    fontweight="bold", zorder=3)
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("Head offset within block")
+    ax.set_ylabel("Block (depth)")
+    ax.grid(True, alpha=0.2)
+
+    # Legend
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    legend = [
+        Patch(facecolor="#e74c3c", label="Dual-stream"),
+        Patch(facecolor="#3498db", label="Single-stream"),
+        Line2D([0], [0], color="#2ecc71", linewidth=2, label="Synergistic (>0)"),
+        Line2D([0], [0], color="#e74c3c", linewidth=2, label="Redundant (<0)"),
+    ]
+    ax.legend(handles=legend, loc="upper right")
+
+    fig.tight_layout()
+    return fig
